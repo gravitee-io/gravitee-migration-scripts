@@ -1,0 +1,13 @@
+{
+  "name": "gravitee-developer-portal-documentation-migration",
+  "version": "1.0.0",
+  "description": "Migrate legacy Gravitee APIM portal documentation (pages collection) to next-gen portal navigation items via the Management API.",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "migrate": "node migrate-portal-documentation.js",
+    "test": "node --test migrate-portal-documentation.test.js"
+  }
+}

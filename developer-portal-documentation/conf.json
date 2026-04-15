@@ -1,0 +1,8 @@
+{
+  "baseUrl": "",
+  "orgId": "",
+  "envId": "",
+  "token": "",
+  "dryRun": true,
+  "reportPath": "migration-report.md"
+}
