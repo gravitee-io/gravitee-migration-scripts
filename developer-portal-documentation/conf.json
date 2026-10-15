@@ -3,6 +3,7 @@
   "orgId": "",
   "envId": "",
   "token": "",
+  "targetApimVersion": "",
   "dryRun": true,
   "reportPath": "migration-report.md"
 }

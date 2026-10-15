@@ -22,10 +22,14 @@
 
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, it, mock } from 'node:test';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, it, mock } from 'node:test';
 
 import {
   apiDisplayName,
+  apiOwnedWriter,
+  checkTargetVersionAgainstServer,
   collectReferencedApiIdsFromNavItems,
   createReport,
   escapeMdCell,
@@ -39,9 +43,12 @@ import {
   migrateSubtreeFlat,
   nextRootOrder,
   pageTitle,
+  parseTargetApimVersion,
+  runMigration,
   uniqueAmongSiblings,
   v1Path,
   v2Path,
+  writerFor,
 } from './migrate-portal-documentation.js';
 
 const sampleCfg = {
@@ -732,5 +739,371 @@ describe('mapLegacyPageToNavPayload — LINK edge cases', () => {
     });
     assert.equal(r.kind, 'LINK');
     assert.equal(r.url, 'https://external.example.com/docs');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// targetApimVersion: the version of the APIM server the documentation is migrated into
+// ---------------------------------------------------------------------------
+
+describe('parseTargetApimVersion', () => {
+  it('accepts major.minor', () => {
+    assert.equal(parseTargetApimVersion('4.12'), '4.12');
+    assert.equal(parseTargetApimVersion('4.13'), '4.13');
+    assert.equal(parseTargetApimVersion('4.100'), '4.100');
+  });
+
+  for (const value of [undefined, null, '', '4', '4.13.1', 'v4.13', '4.13.x', ' 4.13', '4.13 ', 4.13]) {
+    it(`rejects ${JSON.stringify(value)} with the expected format`, () => {
+      assert.throws(() => parseTargetApimVersion(value), /targetApimVersion.*major\.minor.*4\.13/s);
+    });
+  }
+});
+
+describe('writerFor', () => {
+  it('selects the listing-row writer for 4.11 and 4.12', () => {
+    assert.equal(writerFor('4.11'), 'portal');
+    assert.equal(writerFor('4.12'), 'portal');
+  });
+
+  it('selects the API-owned writer for 4.13 and later', () => {
+    assert.equal(writerFor('4.13'), 'api');
+    assert.equal(writerFor('4.14'), 'api');
+    assert.equal(writerFor('5.0'), 'api');
+  });
+
+  it('compares versions numerically', () => {
+    assert.equal(writerFor('4.100'), 'api');
+    assert.throws(() => writerFor('4.9'), /4\.11/);
+  });
+
+  it('refuses a version older than the Next Gen portal navigation', () => {
+    assert.throws(() => writerFor('4.10'), /4\.11 or later/);
+  });
+});
+
+describe('checkTargetVersionAgainstServer', () => {
+  it('passes when the API-owned writer meets a server with the API-scoped endpoints', async () => {
+    mock.method(io, 'hasApiScopedDocumentation', async () => true);
+    await checkTargetVersionAgainstServer(sampleCfg, '4.13', 'api-1');
+  });
+
+  it('passes when the listing-row writer meets a server without them', async () => {
+    mock.method(io, 'hasApiScopedDocumentation', async () => false);
+    await checkTargetVersionAgainstServer(sampleCfg, '4.12', 'api-1');
+  });
+
+  it('stops when 4.13 or later meets a server without the API-scoped endpoints', async () => {
+    mock.method(io, 'hasApiScopedDocumentation', async () => false);
+    await assert.rejects(
+      () => checkTargetVersionAgainstServer(sampleCfg, '4.13', 'api-1'),
+      /does not provide API-owned documentation.*targetApimVersion.*baseUrl/s,
+    );
+  });
+
+  it('stops when 4.11 or 4.12 meets a server that stores documentation as owned by the API', async () => {
+    mock.method(io, 'hasApiScopedDocumentation', async () => true);
+    await assert.rejects(
+      () => checkTargetVersionAgainstServer(sampleCfg, '4.12', 'api-1'),
+      /owned by the API.*targetApimVersion.*baseUrl/s,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The API-owned writer through migrateSubtreeFlat
+// ---------------------------------------------------------------------------
+
+function mockApiIo() {
+  const created = [];
+  const contentUpdates = [];
+  mock.method(io, 'createApiNavItem', async (_cfg, apiId, body) => {
+    const item = { ...body, id: randomUUID() };
+    created.push({ apiId, ...item });
+    return item;
+  });
+  mock.method(io, 'updateApiContent', async (_cfg, apiId, navId, content) => {
+    contentUpdates.push({ apiId, navId, content });
+  });
+  mock.method(io, 'loadContent', async (_cfg, page) => page);
+  return { created, contentUpdates };
+}
+
+describe('migrateSubtreeFlat — API-owned writer', () => {
+  it('creates top items with no parent and nested items under their folder, through the API path', async () => {
+    const pages = [
+      mkPage({ id: 'f1', name: 'Guides', type: 'FOLDER', order: 0 }),
+      mkPage({ id: 'p1', name: 'Auth', type: 'MARKDOWN', content: '# Auth', parentId: 'f1', order: 0 }),
+      mkPage({ id: 'p2', name: 'Intro', type: 'MARKDOWN', content: '# Intro', order: 1 }),
+    ];
+    const { created } = mockApiIo();
+
+    await migrateSubtreeFlat(sampleCfg, pages, new Set(['f1', 'p1', 'p2']), null, 0, false, undefined, freshReport(), [], apiOwnedWriter('api-1'));
+
+    assert.equal(created.length, 3);
+    assert.ok(created.every((c) => c.apiId === 'api-1'));
+    const folder = created.find((c) => c.title === 'Guides');
+    assert.equal('parentId' in folder, false);
+    assert.equal(created.find((c) => c.title === 'Auth').parentId, folder.id);
+    assert.equal('parentId' in created.find((c) => c.title === 'Intro'), false);
+  });
+
+  it('saves a page content through the page, without a content id', async () => {
+    const pages = [mkPage({ id: 'p1', name: 'Intro', type: 'MARKDOWN', content: '# Intro', order: 0 })];
+    const { created, contentUpdates } = mockApiIo();
+
+    await migrateSubtreeFlat(sampleCfg, pages, new Set(['p1']), null, 0, false, undefined, freshReport(), [], apiOwnedWriter('api-1'));
+
+    assert.deepEqual(contentUpdates, [{ apiId: 'api-1', navId: created[0].id, content: '# Intro' }]);
+  });
+
+  it('migrates AsyncAPI pages as ASYNCAPI content', async () => {
+    const pages = [mkPage({ id: 'p1', name: 'Events', type: 'ASYNCAPI', content: 'asyncapi: 2.0.0', order: 0 })];
+    const report = freshReport();
+    const { created, contentUpdates } = mockApiIo();
+
+    await migrateSubtreeFlat(sampleCfg, pages, new Set(['p1']), null, 0, false, undefined, report, [], apiOwnedWriter('api-1'));
+
+    assert.equal(created[0].contentType, 'ASYNCAPI');
+    assert.equal(contentUpdates[0].content, 'asyncapi: 2.0.0');
+    assert.equal(report.skipped.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runMigration against a fake Management API
+// ---------------------------------------------------------------------------
+
+const API_V4 = { id: 'api-4', name: 'Payments', definitionVersion: 'V4' };
+const API_V2 = { id: 'api-2', name: 'Legacy', definitionVersion: 'V2' };
+
+function runCfg(targetApimVersion) {
+  return { ...sampleCfg, targetApimVersion };
+}
+
+function runOptions(overrides = {}) {
+  return { dryRun: false, reportPath: join(tmpdir(), `migration-report-${randomUUID()}.md`), ...overrides };
+}
+
+/**
+ * A Management API holding the given state. `apiScoped` says whether it has the API-scoped documentation
+ * endpoints, as 4.13 and later do. Every request is recorded in the returned array.
+ */
+function fakeServer({ apiScoped, roots = [], envPages = [], apis = [], apiPages = {}, documentation = {}, failCreate = () => false, probeStatus } = {}) {
+  const calls = [];
+  const respond = (status, body) =>
+    new Response(body === undefined ? '' : JSON.stringify(body), { status, statusText: String(status) });
+
+  mock.method(globalThis, 'fetch', async (url, options = {}) => {
+    const method = options.method || 'GET';
+    const { pathname, searchParams } = new URL(url);
+    const body = options.body ? JSON.parse(options.body) : undefined;
+    calls.push({ method, pathname, body });
+
+    const apiPath = pathname.match(/\/apis\/([^/]+)\/portal-navigation-items(.*)$/);
+    if (apiPath) {
+      const [, apiId, rest] = apiPath;
+      if (rest === '/_publish-locations') return probeStatus ? respond(probeStatus, {}) : respond(apiScoped ? 200 : 404, { data: [] });
+      if (!apiScoped) return respond(404, { message: 'Not found' });
+      if (rest === '' && method === 'GET') return respond(200, { items: documentation[apiId] || [], publications: [] });
+      if (rest === '' && method === 'POST') {
+        if (failCreate(body)) return respond(400, { message: 'refused' });
+        return respond(201, { ...body, id: randomUUID() });
+      }
+      if (rest.endsWith('/content') && method === 'PUT') return respond(200, { content: body.content });
+    }
+    if (pathname.endsWith('/portal/pages')) return respond(200, envPages);
+    if (/\/apis\/[^/]+\/pages$/.test(pathname)) return respond(200, { pages: apiPages[pathname.split('/').at(-2)] || [] });
+    if (pathname.endsWith('/apis')) return respond(200, { data: apis, pagination: { pageCount: 1 } });
+    if (pathname.endsWith('/portal-navigation-items') && method === 'GET') {
+      return respond(200, { items: searchParams.get('loadChildren') === 'true' ? roots : roots.filter((r) => r.parentId == null) });
+    }
+    if (pathname.endsWith('/portal-navigation-items') && method === 'POST') {
+      return respond(201, { ...body, id: randomUUID(), portalPageContentId: randomUUID() });
+    }
+    if (pathname.includes('/portal-page-contents/') && method === 'PUT') return respond(200, {});
+    return respond(500, { message: `unexpected ${method} ${pathname}` });
+  });
+  return calls;
+}
+
+const writes = (calls) => calls.filter((c) => c.method !== 'GET');
+const apiDocPage = (apiId, overrides) => ({ id: randomUUID(), type: 'MARKDOWN', content: '# Doc', order: 0, ...overrides, _apiId: apiId });
+
+describe('runMigration — targetApimVersion 4.13 or later', () => {
+  beforeEach(() => mock.method(console, 'log', () => {}));
+
+  it('writes each API documentation through the API path, with no listing row and no APIS folder', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] },
+    });
+
+    await runMigration(runCfg('4.13'), runOptions());
+
+    const created = writes(calls).filter((c) => c.method === 'POST');
+    assert.deepEqual(created.map((c) => c.pathname.split('/environments/DEFAULT')[1]), ['/apis/api-4/portal-navigation-items']);
+    assert.equal(created[0].body.title, 'Intro');
+    assert.ok(writes(calls).some((c) => c.method === 'PUT' && c.pathname.includes('/apis/api-4/portal-navigation-items/')));
+    assert.ok(!calls.some((c) => c.body?.type === 'API' || c.body?.title === 'APIS'));
+  });
+
+  it('skips an API that already has documentation, and reports it', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] },
+      documentation: { 'api-4': [{ id: 'existing', type: 'PAGE', title: 'Written in Gamma' }] },
+    });
+    const options = runOptions();
+
+    const report = await runMigration(runCfg('4.13'), options);
+
+    assert.equal(writes(calls).length, 0);
+    assert.deepEqual(report.apis.alreadyDocumented.map((a) => a.apiId), ['api-4']);
+  });
+
+  it('migrates an API that has no documentation even when DOCUMENTATION_MIGRATION exists', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      roots: [{ id: 'm', title: 'DOCUMENTATION_MIGRATION', parentId: null, type: 'FOLDER' }],
+      envPages: [{ id: 'e1', name: 'Env page', type: 'MARKDOWN', content: 'x' }],
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] },
+    });
+
+    const report = await runMigration(runCfg('4.13'), runOptions());
+
+    const created = writes(calls).filter((c) => c.method === 'POST');
+    assert.ok(created.every((c) => c.pathname.includes('/apis/api-4/')), 'environment documentation stays gated by its folder');
+    assert.equal(created.length, 1);
+    assert.deepEqual(report.apis.migrated.map((a) => a.apiId), ['api-4']);
+  });
+
+  it('migrates environment documentation into DOCUMENTATION_MIGRATION/ENVIRONMENT when the folder is absent', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      envPages: [{ id: 'e1', name: 'Env page', type: 'MARKDOWN', content: 'x' }],
+      apis: [API_V4],
+    });
+
+    await runMigration(runCfg('4.13'), runOptions());
+
+    const titles = writes(calls).filter((c) => c.method === 'POST').map((c) => c.body.title);
+    assert.deepEqual(titles, ['DOCUMENTATION_MIGRATION', 'ENVIRONMENT', 'Env page']);
+  });
+
+  it('names an API whose migration failed part-way as partially migrated', async () => {
+    fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: {
+        'api-4': [
+          apiDocPage('api-4', { name: 'First', order: 0 }),
+          apiDocPage('api-4', { name: 'Refused', order: 1 }),
+        ],
+      },
+      failCreate: (body) => body.title === 'Refused',
+    });
+
+    const report = await runMigration(runCfg('4.13'), runOptions());
+
+    assert.equal(report.apis.partial.length, 1);
+    assert.equal(report.apis.partial[0].apiId, 'api-4');
+    assert.deepEqual(report.apis.partial[0].created, ['First']);
+    assert.match(formatMigrationReportMarkdown(report), /Partially migrated/);
+  });
+
+  it("migrates a V2 API's documentation as API-owned, like a V4 API", async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      apis: [API_V2],
+      apiPages: { 'api-2': [apiDocPage('api-2', { name: 'Old doc' })] },
+    });
+
+    await runMigration(runCfg('4.13'), runOptions());
+
+    assert.ok(writes(calls).some((c) => c.method === 'POST' && c.pathname.includes('/apis/api-2/portal-navigation-items')));
+  });
+
+  it('writes nothing in dry run, while still checking the server and the existing documentation', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] },
+    });
+
+    await runMigration(runCfg('4.13'), runOptions({ dryRun: true }));
+
+    assert.equal(writes(calls).length, 0);
+    assert.ok(calls.some((c) => c.pathname.endsWith('/apis/api-4/portal-navigation-items/_publish-locations')));
+    assert.ok(calls.some((c) => c.method === 'GET' && c.pathname.endsWith('/apis/api-4/portal-navigation-items')));
+  });
+
+  it('says which target version and writer ran', async () => {
+    fakeServer({ apiScoped: true, apis: [API_V4], apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] } });
+
+    const report = await runMigration(runCfg('4.13'), runOptions());
+
+    assert.match(formatMigrationReportMarkdown(report), /Target APIM version.*4\.13/);
+    assert.match(formatMigrationReportMarkdown(report), /owned by each API/);
+  });
+});
+
+describe('runMigration — checks against the server before writing', () => {
+  beforeEach(() => mock.method(console, 'log', () => {}));
+
+  it('stops when 4.13 or later meets a server without the API-scoped endpoints', async () => {
+    const calls = fakeServer({ apiScoped: false, apis: [API_V4], apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] } });
+
+    await assert.rejects(() => runMigration(runCfg('4.13'), runOptions()), /does not provide API-owned documentation/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  it('stops when 4.12 meets a server that stores documentation as owned by the API', async () => {
+    const calls = fakeServer({ apiScoped: true, apis: [API_V4], apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] } });
+
+    await assert.rejects(() => runMigration(runCfg('4.12'), runOptions()), /owned by the API/);
+    assert.equal(writes(calls).length, 0);
+  });
+
+  it('stops on any other answer from the server', async () => {
+    const calls = fakeServer({ probeStatus: 500, apis: [API_V4], apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] } });
+
+    await assert.rejects(() => runMigration(runCfg('4.13'), runOptions()), /HTTP 500/);
+    assert.equal(writes(calls).length, 0);
+  });
+});
+
+describe('runMigration — targetApimVersion 4.11 or 4.12', () => {
+  beforeEach(() => mock.method(console, 'log', () => {}));
+
+  it('creates a listing row under DOCUMENTATION_MIGRATION/APIS, as before', async () => {
+    const calls = fakeServer({ apiScoped: false, apis: [API_V4], apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] } });
+
+    await runMigration(runCfg('4.12'), runOptions());
+
+    const created = writes(calls).filter((c) => c.method === 'POST').map((c) => [c.body.type, c.body.title]);
+    assert.deepEqual(created, [
+      ['FOLDER', 'DOCUMENTATION_MIGRATION'],
+      ['FOLDER', 'APIS'],
+      ['API', 'Payments'],
+      ['PAGE', 'Intro'],
+    ]);
+  });
+
+  it('still stops at once when DOCUMENTATION_MIGRATION exists', async () => {
+    const calls = fakeServer({
+      apiScoped: false,
+      roots: [{ id: 'm', title: 'DOCUMENTATION_MIGRATION', parentId: null, type: 'FOLDER' }],
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Intro' })] },
+    });
+
+    const report = await runMigration(runCfg('4.12'), runOptions());
+
+    assert.equal(report.status, 'skipped_already_migrated');
+    assert.equal(writes(calls).length, 0);
   });
 });
