@@ -9,24 +9,29 @@
  *   - Management API v1: GET .../organizations/{org}/environments/{env}/portal/pages
  *   - Management API v2: GET .../environments/{env}/apis (paginated), GET .../apis/{apiId}/pages
  *
- * Writes:
- *   - Management API v2: POST .../portal-navigation-items (and PUT .../portal-page-contents/{id} for PAGE bodies)
+ * Writes (Management API v2), chosen by `targetApimVersion`, the version of the APIM server at `baseUrl`:
+ *   - 4.11, 4.12: POST .../portal-navigation-items (and PUT .../portal-page-contents/{id} for PAGE bodies),
+ *     each API's pages under a listing row in DOCUMENTATION_MIGRATION/APIS
+ *   - 4.13 and later: each API's pages as documentation owned by the API, through
+ *     POST .../apis/{apiId}/portal-navigation-items and PUT .../apis/{apiId}/portal-navigation-items/{navId}/content
  *
  * Configuration (required): `conf.json` next to this script.
- * Shape: `{ "baseUrl", "orgId", "envId", "token", "dryRun"?, "reportPath"? }`
+ * Shape: `{ "baseUrl", "orgId", "envId", "token", "targetApimVersion", "dryRun"?, "reportPath"? }`
  *
  * Run: `npm run migrate` or `node migrate-portal-documentation.js` (from this directory).
  *
  * Idempotency:
- *   By default, if the TOP_NAVBAR root folder named DOCUMENTATION_MIGRATION already exists, the script exits
+ *   4.11, 4.12: if the TOP_NAVBAR root folder named DOCUMENTATION_MIGRATION already exists, the script exits
  *   immediately without loading legacy pages or calling create APIs — safe to run multiple times.
+ *   4.13 and later: that folder gates environment documentation only; an API that already has documentation
+ *   is skipped, so a new run migrates only the APIs not done yet.
  *
  * Resulting tree (TOP_NAVBAR):
  *   DOCUMENTATION_MIGRATION
  *   ├── ENVIRONMENT
  *   │   ├── HOMEPAGE          (environment-scoped legacy pages with homepage=true only)
  *   │   └── …                 (other environment documentation, non-homepage)
- *   └── APIS
+ *   └── APIS              (4.11, 4.12 only)
  *       ├── My API            (type API — all pages for that API, including API homepage)
  *       └── …
  */
@@ -45,6 +50,51 @@ const CONFIG = {
   /** Default report path (relative to cwd unless absolute). Overridden in conf.json. */
   reportPath: 'migration-report.md',
 };
+
+/** First APIM version whose portal navigation exists at all. */
+const NEXT_GEN_NAVIGATION_SINCE = '4.11';
+/**
+ * First APIM version that stores API documentation as owned by the API and has the API-scoped endpoints.
+ * It assumes that work is backported to 4.13; if it is not, this becomes '4.14'. The check against the
+ * server stops a run with a wrong value either way.
+ */
+const API_OWNED_DOCUMENTATION_SINCE = '4.13';
+const TARGET_APIM_VERSION_FORMAT = /^\d+\.\d+$/;
+
+/**
+ * `targetApimVersion` is the version of the APIM server at `baseUrl`, the one the documentation is
+ * migrated into — not the version being upgraded from.
+ */
+function parseTargetApimVersion(value) {
+  if (typeof value !== 'string' || !TARGET_APIM_VERSION_FORMAT.test(value)) {
+    throw new Error(
+      `targetApimVersion must be the version of the APIM server at baseUrl, as major.minor, for example "4.13" (got ${JSON.stringify(value)}).`,
+    );
+  }
+  return value;
+}
+
+function compareVersions(a, b) {
+  const [aMajor, aMinor] = a.split('.').map(Number);
+  const [bMajor, bMinor] = b.split('.').map(Number);
+  return aMajor - bMajor || aMinor - bMinor;
+}
+
+/** 'portal' writes each API's pages under a listing row; 'api' writes them as documentation owned by the API. */
+function writerFor(targetApimVersion) {
+  if (compareVersions(targetApimVersion, NEXT_GEN_NAVIGATION_SINCE) < 0) {
+    throw new Error(
+      `targetApimVersion ${targetApimVersion} is too old: the Next Gen portal navigation needs APIM ${NEXT_GEN_NAVIGATION_SINCE} or later.`,
+    );
+  }
+  return compareVersions(targetApimVersion, API_OWNED_DOCUMENTATION_SINCE) >= 0 ? 'api' : 'portal';
+}
+
+function describeWriter(writer) {
+  return writer === 'api'
+    ? 'written as owned by each API'
+    : `written under listing rows in ${CONFIG.migrationFolderName}/${CONFIG.apisFolderName}`;
+}
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const MIGRATION_CONFIG_PATH = join(SCRIPT_DIR, 'conf.json');
@@ -88,20 +138,32 @@ function loadMigrationConfig() {
   const envId = typeof fileConfig.envId === 'string' ? fileConfig.envId : '';
   const token = typeof fileConfig.token === 'string' ? fileConfig.token : '';
 
-  CONFIG.dryRun = fileConfig.dryRun === true;
-  CONFIG.reportPath =
-    (typeof fileConfig.reportPath === 'string' ? fileConfig.reportPath : '') || CONFIG.reportPath;
-
   if (!baseUrl || !orgId || !envId || !token) {
     console.error('Missing baseUrl, orgId, envId, or token in conf.json (all are required).');
     process.exit(1);
   }
 
+  let targetApimVersion;
+  try {
+    targetApimVersion = parseTargetApimVersion(fileConfig.targetApimVersion);
+    writerFor(targetApimVersion);
+  } catch (e) {
+    console.error(`Invalid conf.json: ${e.message}`);
+    process.exit(1);
+  }
+
   return {
-    baseUrl: baseUrl.replace(/\/$/, ''),
-    orgId,
-    envId,
-    token,
+    cfg: {
+      baseUrl: baseUrl.replace(/\/$/, ''),
+      orgId,
+      envId,
+      token,
+      targetApimVersion,
+    },
+    options: {
+      dryRun: fileConfig.dryRun === true,
+      reportPath: typeof fileConfig.reportPath === 'string' ? fileConfig.reportPath : '',
+    },
   };
 }
 
@@ -213,7 +275,7 @@ function looksLikeHttpUrl(s) {
  * Maps legacy page to nav payload.
  * Types that cannot be represented as portal `GRAVITEE_MARKDOWN` / `OPENAPI` without lossy conversion return `{ kind: 'SKIP', reason }`.
  */
-function mapLegacyPageToNavPayload(p) {
+function mapLegacyPageToNavPayload(p, { asyncApi = false } = {}) {
   if (isFolderLike(p)) {
     return { kind: 'FOLDER' };
   }
@@ -236,11 +298,11 @@ function mapLegacyPageToNavPayload(p) {
   const raw = p.content || '';
 
   if (t === 'SWAGGER') {
-    return { kind: 'PAGE', contentType: 'OPENAPI', content: raw };
+    return pagePayload('OPENAPI', raw, t);
   }
 
   if (t === 'MARKDOWN') {
-    return { kind: 'PAGE', contentType: 'GRAVITEE_MARKDOWN', content: raw };
+    return pagePayload('GRAVITEE_MARKDOWN', raw, t);
   }
 
   if (t === 'MARKDOWN_TEMPLATE') {
@@ -259,6 +321,10 @@ function mapLegacyPageToNavPayload(p) {
       reason:
         'Translation pages are not migrated (recreate localized content in the portal navigation model if needed).',
     };
+  }
+
+  if (t === 'ASYNCAPI' && asyncApi) {
+    return pagePayload('ASYNCAPI', raw, t);
   }
 
   if (t === 'ASYNCAPI') {
@@ -284,6 +350,18 @@ function mapLegacyPageToNavPayload(p) {
     legacyType: t,
     reason: `Legacy type "${t}" is not migrated (unsupported for automatic portal navigation migration).`,
   };
+}
+
+/** The portal refuses a page with blank content, so such a page is skipped before anything is created for it. */
+function pagePayload(contentType, content, legacyType) {
+  if (content.trim() === '') {
+    return {
+      kind: 'SKIP',
+      legacyType,
+      reason: 'The page has no content, which portal page content does not accept; nothing was created for it.',
+    };
+  }
+  return { kind: 'PAGE', contentType, content };
 }
 
 async function fetchEnvPortalPages(cfg) {
@@ -364,6 +442,7 @@ function createReport(cfg) {
     migrated: [],
     skipped: [],
     structure: [],
+    apis: { migrated: [], alreadyDocumented: [], partial: [] },
   };
 }
 
@@ -418,6 +497,13 @@ function formatMigrationReportMarkdown(report) {
   lines.push(`- **Organization:** ${escapeMdCell(report.organizationId)}`);
   lines.push(`- **Environment:** ${escapeMdCell(report.environmentId)}`);
   lines.push(`- **Dry run:** ${report.dryRun ? 'yes' : 'no'}`);
+  if (report.targetApimVersion) {
+    lines.push(`- **Target APIM version:** ${escapeMdCell(report.targetApimVersion)}`);
+    lines.push(`- **API documentation:** ${describeWriter(report.writer)}`);
+  }
+  if (report.environmentNote) {
+    lines.push(`- **Environment documentation:** ${escapeMdCell(report.environmentNote)}`);
+  }
   if (report.abortReason) {
     lines.push(`- **Note:** ${escapeMdCell(report.abortReason)}`);
   }
@@ -434,6 +520,33 @@ function formatMigrationReportMarkdown(report) {
   lines.push(`| Legacy pages / links migrated | ${migratedCount} |`);
   lines.push(`| Legacy pages skipped | ${skippedCount} |`);
   lines.push('');
+
+  if (report.writer === 'api') {
+    lines.push('## APIs');
+    lines.push('');
+    lines.push(`| Result | APIs |`);
+    lines.push(`| --- | ---: |`);
+    lines.push(`| Migrated | ${report.apis.migrated.length} |`);
+    lines.push(`| Skipped: already have documentation | ${report.apis.alreadyDocumented.length} |`);
+    lines.push(`| Partially migrated | ${report.apis.partial.length} |`);
+    lines.push('');
+    if (report.apis.partial.length) {
+      lines.push('### Partially migrated APIs');
+      lines.push('');
+      lines.push(
+        'These APIs now have some documentation, so the next run skips them. Delete what was created for them, then run again.',
+      );
+      lines.push('');
+      lines.push(`| API | Created | Failed |`);
+      lines.push(`| --- | --- | --- |`);
+      for (const a of report.apis.partial) {
+        lines.push(
+          `| ${escapeMdCell(a.apiName || a.apiId)} | ${escapeMdCell(a.created.join(', '))} | ${escapeMdCell(a.failed.join(', '))} |`,
+        );
+      }
+      lines.push('');
+    }
+  }
 
   if (report.structure?.length) {
     lines.push('## Structure created');
@@ -539,7 +652,11 @@ function printMigrationSuccessMessage(report, reportPath) {
   } else {
     console.log('Portal navigation migration — completed successfully');
     console.log(sep);
-    console.log('Legacy documentation was imported into portal navigation under the new folder tree.');
+    console.log(
+      report.writer === 'api'
+        ? 'Legacy API documentation was imported as documentation owned by each API.'
+        : 'Legacy documentation was imported into portal navigation under the new folder tree.',
+    );
   }
   console.log('');
   console.log(`  Organization     ${report.organizationId}`);
@@ -554,6 +671,10 @@ function printMigrationSuccessMessage(report, reportPath) {
   console.log('');
   if (report.dryRun) {
     console.log('  To apply for real: set "dryRun": false in conf.json and run again.');
+  } else if (report.writer === 'api') {
+    console.log("  What's next: publish each API's documentation from the Gamma Console, or place the API");
+    console.log('               in the developer portal from the portal editor.');
+    console.log('               Re-running this script migrates only the APIs that have no documentation yet.');
   } else {
     console.log("  What's next: open the Management Console > Next Gen Portal Settings,");
     console.log('               publish items when you are ready, and check the developer portal.');
@@ -602,13 +723,53 @@ async function updatePortalPageContent(cfg, portalPageContentId, content) {
   });
 }
 
+function apiNavigationPath(cfg, apiId, subPath = '') {
+  return v2Path(cfg, `/apis/${encodeURIComponent(apiId)}/portal-navigation-items${subPath}`);
+}
+
+/** True when the server has the API-scoped documentation endpoints (4.13 and later), false when it answers 404. */
+async function hasApiScopedDocumentation(cfg, apiId) {
+  try {
+    await apiFetch(cfg, apiNavigationPath(cfg, apiId, '/_publish-locations'), { method: 'GET' });
+    return true;
+  } catch (e) {
+    if (e.status === 404) return false;
+    throw e;
+  }
+}
+
+async function fetchApiDocumentation(cfg, apiId) {
+  const res = await apiFetch(cfg, apiNavigationPath(cfg, apiId), { method: 'GET' });
+  return res?.items || [];
+}
+
+async function createApiNavigationItem(cfg, apiId, body) {
+  if (CONFIG.dryRun) {
+    console.log(`[dry-run] POST apis/${apiId}/portal-navigation-items`, JSON.stringify(body, null, 0));
+    return { ...body, id: randomUUID() };
+  }
+  return apiFetch(cfg, apiNavigationPath(cfg, apiId), { method: 'POST', body: JSON.stringify(body) });
+}
+
+async function updateApiPageContent(cfg, apiId, navId, content) {
+  if (CONFIG.dryRun) {
+    console.log(`[dry-run] PUT apis/${apiId}/portal-navigation-items/${navId}/content`, `(content length ${content?.length ?? 0})`);
+    return;
+  }
+  await apiFetch(cfg, apiNavigationPath(cfg, apiId, `/${encodeURIComponent(navId)}/content`), {
+    method: 'PUT',
+    body: JSON.stringify({ content }),
+  });
+}
+
 /**
  * Ensure PAGE has body (list endpoints may omit large content).
  */
+const LEGACY_PAGE_TYPES = new Set(['MARKDOWN', 'SWAGGER', 'ASYNCAPI']);
+
 async function ensurePageContent(cfg, page, scope, apiId) {
-  const payload = mapLegacyPageToNavPayload(page);
-  if (payload.kind === 'SKIP') return page;
-  if (payload.kind !== 'PAGE') return page;
+  // Decided by type, not by the mapped payload: a page the list returned without its content maps to a skip
+  if (!LEGACY_PAGE_TYPES.has((page.type || 'MARKDOWN').toUpperCase())) return page;
   if (page.content != null && String(page.content).length > 0) return page;
   try {
     if (scope === 'ENVIRONMENT') {
@@ -631,13 +792,58 @@ const io = {
   createNavItem: createPortalNavigationItem,
   updateContent: updatePortalPageContent,
   loadContent: ensurePageContent,
+  hasApiScopedDocumentation,
+  fetchApiDocumentation,
+  createApiNavItem: createApiNavigationItem,
+  updateApiContent: updateApiPageContent,
 };
+
+/** Writes each item where today's script always has: in the portal tree, content saved by content id. */
+const listingRowWriter = {
+  supportsAsyncApi: false,
+  createItem: (cfg, body) => io.createNavItem(cfg, body),
+  async saveContent(cfg, created, content, title) {
+    const contentId = created.portalPageContentId;
+    if (!contentId) {
+      throw new Error(`PAGE created without portalPageContentId for ${title}`);
+    }
+    await io.updateContent(cfg, contentId, content);
+  },
+};
+
+/** Writes each item as documentation owned by the API; a top item has no parent, and content is saved through the page. */
+function apiOwnedWriter(apiId) {
+  return {
+    supportsAsyncApi: true,
+    createItem(cfg, body) {
+      const { parentId, ...withoutParent } = body;
+      return io.createApiNavItem(cfg, apiId, parentId == null ? withoutParent : body);
+    },
+    saveContent: (cfg, created, content) => io.updateApiContent(cfg, apiId, created.id, content),
+  };
+}
+
+/** Stops before anything is written when targetApimVersion and the server at baseUrl disagree. */
+async function checkTargetVersionAgainstServer(cfg, targetApimVersion, apiId) {
+  const writer = writerFor(targetApimVersion);
+  const serverStoresApiOwnedDocumentation = await io.hasApiScopedDocumentation(cfg, apiId);
+  if (writer === 'api' && !serverStoresApiOwnedDocumentation) {
+    throw new Error(
+      `targetApimVersion is ${targetApimVersion}, but the target server does not provide API-owned documentation, which APIM ${API_OWNED_DOCUMENTATION_SINCE} and later have. Set targetApimVersion to the version of the APIM server at baseUrl (${cfg.baseUrl}).`,
+    );
+  }
+  if (writer === 'portal' && serverStoresApiOwnedDocumentation) {
+    throw new Error(
+      `targetApimVersion is ${targetApimVersion}, but the target server stores API documentation as owned by the API, as APIM ${API_OWNED_DOCUMENTATION_SINCE} and later do. Set targetApimVersion to the version of the APIM server at baseUrl (${cfg.baseUrl}).`,
+    );
+  }
+}
 
 /**
  * Recursively create nav items (folders recurse; pages and links do not), mirroring migrateSubtreeSimple in the mongosh script.
  * @param {Set<string>} [initialSiblingTitles] — titles already taken at the first level under `parentNavId` (e.g. HOMEPAGE folder).
  */
-async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffset, fetchContent, initialSiblingTitles, report, apis) {
+async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffset, fetchContent, initialSiblingTitles, report, apis, writer = listingRowWriter) {
   function normalizeParentId(page) {
     const pid = page.parentId;
     if (!pid || !subsetIds.has(pid)) return null;
@@ -660,7 +866,7 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
 
       try {
         const fullPage = fetchContent ? await io.loadContent(cfg, p, p._scope, p._apiId) : p;
-        const payload = mapLegacyPageToNavPayload(fullPage);
+        const payload = mapLegacyPageToNavPayload(fullPage, { asyncApi: writer.supportsAsyncApi });
 
         if (payload.kind === 'SKIP') {
           recordSkippedPage(report, {
@@ -685,7 +891,7 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
             published: false,
             order: ord,
           };
-          const created = await io.createNavItem(cfg, body);
+          const created = await writer.createItem(cfg, body);
           ord += 1;
           recordMigratedPage(report, {
             legacyPageId: getPageId(p),
@@ -708,7 +914,7 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
             published: false,
             order: ord,
           };
-          await io.createNavItem(cfg, body);
+          await writer.createItem(cfg, body);
           ord += 1;
           recordMigratedPage(report, {
             legacyPageId: getPageId(p),
@@ -730,17 +936,18 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
             order: ord,
             contentType: payload.contentType,
           };
-          const created = await io.createNavItem(cfg, body);
-          const contentId = created.portalPageContentId;
-          if (!contentId) {
-            throw new Error(`PAGE created without portalPageContentId for ${title}`);
+          const created = await writer.createItem(cfg, body);
+          try {
+            await writer.saveContent(cfg, created, payload.content, title);
+          } catch (err) {
+            err.createdWithoutContent = true;
+            throw err;
           }
-          await io.updateContent(cfg, contentId, payload.content);
           ord += 1;
-          const result =
-            payload.contentType === 'OPENAPI'
-              ? 'OpenAPI / Swagger body stored in portal page content'
-              : 'Markdown body copied as-is into portal page content';
+          const result = {
+            OPENAPI: 'OpenAPI / Swagger body stored in portal page content',
+            ASYNCAPI: 'AsyncAPI body stored in portal page content',
+          }[payload.contentType] ?? 'Markdown body copied as-is into portal page content';
           recordMigratedPage(report, {
             legacyPageId: getPageId(p),
             title,
@@ -760,7 +967,10 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
           scope,
           apiId,
           apiName,
-          reason: `Migration failed: ${err.message || err}`,
+          createdWithoutContent: err.createdWithoutContent === true,
+          reason: err.createdWithoutContent
+            ? `Migration failed: the page was created without its content, delete it before running again (${err.message || err})`
+            : `Migration failed: ${err.message || err}`,
         });
       }
     }
@@ -770,18 +980,28 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
   await walk(null, parentNavId, rootTitles, orderOffset);
 }
 
-async function run() {
-  const cfg = loadMigrationConfig();
+/**
+ * One migration run against the server described by `cfg`. Stops, by throwing, before anything is
+ * written when `cfg.targetApimVersion` and the server disagree. Returns the report it wrote.
+ */
+async function runMigration(cfg, options = {}) {
+  CONFIG.dryRun = options.dryRun === true;
+  CONFIG.reportPath = options.reportPath || 'migration-report.md';
+  const writer = writerFor(cfg.targetApimVersion);
   const report = createReport(cfg);
+  report.targetApimVersion = cfg.targetApimVersion;
+  report.writer = writer;
 
   console.log(`Base URL: ${cfg.baseUrl}, org=${cfg.orgId}, env=${cfg.envId}, dryRun=${CONFIG.dryRun}`);
+  console.log(`Target APIM version: ${cfg.targetApimVersion} — API documentation ${describeWriter(writer)}.`);
 
-  if (await migrationFolderExists(cfg, CONFIG.migrationFolderName)) {
+  const migrationFolderAlreadyExists = await migrationFolderExists(cfg, CONFIG.migrationFolderName);
+  if (migrationFolderAlreadyExists && writer === 'portal') {
     report.status = 'skipped_already_migrated';
     report.abortReason = `TOP_NAVBAR folder "${CONFIG.migrationFolderName}" already exists — migration not re-run (idempotent).`;
     const out = writeMigrationReportFile(report, CONFIG.reportPath);
     printIdempotentSkipMessage(CONFIG.migrationFolderName, out);
-    return;
+    return report;
   }
 
   console.log('Fetching environment portal pages...');
@@ -814,23 +1034,31 @@ async function run() {
     report.abortReason = 'No legacy pages returned by the Management API.';
     const out = writeMigrationReportFile(report, CONFIG.reportPath);
     printNoPagesMessage(out);
-    return;
+    return report;
   }
 
-  const roots = await fetchRootNavbarItems(cfg);
-  const migrationRootOrder = nextRootOrder(roots);
+  // The environment part writes the same way for every version, so only a run with APIs needs the check
+  const firstApiId = apis.find((api) => api.id)?.id;
+  if (firstApiId) {
+    await checkTargetVersionAgainstServer(cfg, cfg.targetApimVersion, firstApiId);
+  }
 
-  const body = {
-    type: 'FOLDER',
-    title: CONFIG.migrationFolderName,
-    area: 'TOP_NAVBAR',
-    visibility: 'PRIVATE',
-    published: false,
-    order: migrationRootOrder,
-  };
-  const migrationRoot = await io.createNavItem(cfg, body);
-  const migrationId = migrationRoot.id;
-  recordStructure(report, { role: 'Root migration folder', title: CONFIG.migrationFolderName });
+  let migrationId = null;
+  async function ensureMigrationRoot() {
+    if (migrationId) return migrationId;
+    const roots = await fetchRootNavbarItems(cfg);
+    const migrationRoot = await io.createNavItem(cfg, {
+      type: 'FOLDER',
+      title: CONFIG.migrationFolderName,
+      area: 'TOP_NAVBAR',
+      visibility: 'PRIVATE',
+      published: false,
+      order: nextRootOrder(roots),
+    });
+    migrationId = migrationRoot.id;
+    recordStructure(report, { role: 'Root migration folder', title: CONFIG.migrationFolderName });
+    return migrationId;
+  }
 
   const hasEnvDocs = envTagged.length > 0;
   const hasApiDocs = apiTagged.length > 0;
@@ -853,13 +1081,16 @@ async function run() {
   let migrationChildOrder = 0;
   const migrationTitleUsed = new Set();
 
-  if (hasEnvDocs) {
+  if (hasEnvDocs && migrationFolderAlreadyExists) {
+    report.environmentNote = `not migrated: TOP_NAVBAR folder "${CONFIG.migrationFolderName}" already exists.`;
+    console.log(`Environment documentation skipped: "${CONFIG.migrationFolderName}" already exists.`);
+  } else if (hasEnvDocs) {
     console.log(`Migrating ${envTagged.length} environment page(s)...`);
     const envFolder = await io.createNavItem(cfg, {
       type: 'FOLDER',
       title: uniqueAmongSiblings(CONFIG.environmentFolderName, migrationTitleUsed),
       area: 'TOP_NAVBAR',
-      parentId: migrationId,
+      parentId: await ensureMigrationRoot(),
       visibility: 'PRIVATE',
       published: false,
       order: migrationChildOrder,
@@ -892,14 +1123,16 @@ async function run() {
     }
   }
 
-  if (hasApiDocs) {
+  if (hasApiDocs && writer === 'api') {
+    await migrateApiOwnedDocumentation(cfg, apis, apiPagesByApiId, allPages, report);
+  } else if (hasApiDocs) {
     const existingApiIdsInNav = collectReferencedApiIdsFromNavItems(await fetchTopNavbarNavigationItemsWithChildren(cfg));
 
     const apisFolder = await io.createNavItem(cfg, {
       type: 'FOLDER',
       title: uniqueAmongSiblings(CONFIG.apisFolderName, migrationTitleUsed),
       area: 'TOP_NAVBAR',
-      parentId: migrationId,
+      parentId: await ensureMigrationRoot(),
       visibility: 'PRIVATE',
       published: false,
       order: migrationChildOrder,
@@ -909,11 +1142,7 @@ async function run() {
     recordStructure(report, { role: 'APIs container folder', title: CONFIG.apisFolderName });
 
     const apiTitleUsed = new Set();
-    const apiIdsToMigrate = [...apiPagesByApiId.keys()].sort((a, b) => {
-      const apiA = apis.find((x) => x.id === a);
-      const apiB = apis.find((x) => x.id === b);
-      return pageTitle(apiA || { name: a }).localeCompare(pageTitle(apiB || { name: b }));
-    });
+    const apiIdsToMigrate = sortApiIdsByName(apiPagesByApiId.keys(), apis);
 
     const totalApis = apiIdsToMigrate.length;
     console.log(`Migrating documentation for ${totalApis} API(s)...`);
@@ -988,6 +1217,84 @@ async function run() {
 
   const reportOut = writeMigrationReportFile(report, CONFIG.reportPath);
   printMigrationSuccessMessage(report, reportOut);
+  return report;
+}
+
+function sortApiIdsByName(apiIds, apis) {
+  return [...apiIds].sort((a, b) => {
+    const apiA = apis.find((x) => x.id === a);
+    const apiB = apis.find((x) => x.id === b);
+    return pageTitle(apiA || { name: a }).localeCompare(pageTitle(apiB || { name: b }));
+  });
+}
+
+/**
+ * Each API's legacy pages as documentation owned by the API, top items with no parent. An API that already
+ * has documentation is skipped rather than merged into, which also makes a new run resume where this one
+ * stopped; an API that failed part-way is reported, since the documentation it now has makes the next run skip it.
+ */
+async function migrateApiOwnedDocumentation(cfg, apis, apiPagesByApiId, allPages, report) {
+  const apiIds = sortApiIdsByName(apiPagesByApiId.keys(), apis);
+  console.log(`Migrating documentation for ${apiIds.length} API(s), as documentation owned by each API...`);
+
+  for (let apiIdx = 0; apiIdx < apiIds.length; apiIdx++) {
+    const apiId = apiIds[apiIdx];
+    const subsetIds = apiPagesByApiId.get(apiId);
+    const pagesForApi = allPages.filter((p) => subsetIds.has(getPageId(p)));
+    const apiName = apiDisplayName(apiId, apis);
+    console.log(`  [${apiIdx + 1}/${apiIds.length}] ${apiName} (${pagesForApi.length} page(s))`);
+
+    const skipAll = (reason) => {
+      for (const p of pagesForApi) {
+        recordSkippedPage(report, {
+          legacyPageId: getPageId(p),
+          title: pageTitle(p),
+          legacyType: (p.type || 'MARKDOWN').toUpperCase(),
+          scope: 'API',
+          apiId,
+          apiName,
+          reason,
+        });
+      }
+    };
+
+    let existing;
+    try {
+      existing = await io.fetchApiDocumentation(cfg, apiId);
+    } catch (err) {
+      console.warn(`[error] API "${apiName}" (${apiId}): ${err.message || err}`);
+      skipAll(`API migration failed: ${err.message || err}`);
+      continue;
+    }
+    if (existing.length > 0) {
+      console.warn(`[skip] API "${apiName}" (${apiId}) already has documentation — legacy docs for this API were not copied.`);
+      report.apis.alreadyDocumented.push({ apiId, apiName });
+      skipAll('This API already has documentation. Legacy pages are not merged into it; remove its documentation first to migrate them.');
+      continue;
+    }
+
+    const migratedBefore = report.migrated.length;
+    const skippedBefore = report.skipped.length;
+    await migrateSubtreeFlat(cfg, pagesForApi, subsetIds, null, 0, true, undefined, report, apis, apiOwnedWriter(apiId));
+    const skippedNow = report.skipped.slice(skippedBefore);
+    // A page created without its content is on the API too, and makes the next run skip it
+    const created = [
+      ...report.migrated.slice(migratedBefore).map((m) => m.title),
+      ...skippedNow.filter((s) => s.createdWithoutContent).map((s) => s.title),
+    ];
+    const failed = skippedNow.filter((s) => String(s.reason).startsWith('Migration failed')).map((s) => s.title);
+
+    if (created.length > 0 && failed.length > 0) {
+      report.apis.partial.push({ apiId, apiName, created, failed });
+    } else if (created.length > 0) {
+      report.apis.migrated.push({ apiId, apiName });
+    }
+  }
+}
+
+async function run() {
+  const { cfg, options } = loadMigrationConfig();
+  await runMigration(cfg, options);
 }
 
 /** True when this file is the process entrypoint (not when imported by tests). */
@@ -996,8 +1303,11 @@ const isMainModule =
 
 export {
   apiDisplayName,
+  apiOwnedWriter,
+  checkTargetVersionAgainstServer,
   collectReferencedApiIdsFromNavItems,
   createReport,
+  ensurePageContent,
   escapeMdCell,
   formatMigrationReportMarkdown,
   getPageId,
@@ -1009,9 +1319,12 @@ export {
   migrateSubtreeFlat,
   nextRootOrder,
   pageTitle,
+  parseTargetApimVersion,
+  runMigration,
   uniqueAmongSiblings,
   v1Path,
   v2Path,
+  writerFor,
 };
 
 if (isMainModule) {
