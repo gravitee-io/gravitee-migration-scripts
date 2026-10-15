@@ -32,6 +32,7 @@ import {
   checkTargetVersionAgainstServer,
   collectReferencedApiIdsFromNavItems,
   createReport,
+  ensurePageContent,
   escapeMdCell,
   formatMigrationReportMarkdown,
   getPageId,
@@ -889,7 +890,7 @@ function runOptions(overrides = {}) {
  * A Management API holding the given state. `apiScoped` says whether it has the API-scoped documentation
  * endpoints, as 4.13 and later do. Every request is recorded in the returned array.
  */
-function fakeServer({ apiScoped, roots = [], envPages = [], apis = [], apiPages = {}, documentation = {}, failCreate = () => false, probeStatus } = {}) {
+function fakeServer({ apiScoped, roots = [], envPages = [], apis = [], apiPages = {}, documentation = {}, failCreate = () => false, failContent = () => false, probeStatus, pageDetails = {} } = {}) {
   const calls = [];
   const respond = (status, body) =>
     new Response(body === undefined ? '' : JSON.stringify(body), { status, statusText: String(status) });
@@ -910,10 +911,15 @@ function fakeServer({ apiScoped, roots = [], envPages = [], apis = [], apiPages 
         if (failCreate(body)) return respond(400, { message: 'refused' });
         return respond(201, { ...body, id: randomUUID() });
       }
-      if (rest.endsWith('/content') && method === 'PUT') return respond(200, { content: body.content });
+      if (rest.endsWith('/content') && method === 'PUT') {
+        if (failContent(body)) return respond(400, { message: 'invalid content' });
+        return respond(200, { content: body.content });
+      }
     }
     if (pathname.endsWith('/portal/pages')) return respond(200, envPages);
     if (/\/apis\/[^/]+\/pages$/.test(pathname)) return respond(200, { pages: apiPages[pathname.split('/').at(-2)] || [] });
+    const detail = pathname.match(/\/apis\/[^/]+\/pages\/([^/]+)$/);
+    if (detail && pageDetails[detail[1]]) return respond(200, pageDetails[detail[1]]);
     if (pathname.endsWith('/apis')) return respond(200, { data: apis, pagination: { pageCount: 1 } });
     if (pathname.endsWith('/portal-navigation-items') && method === 'GET') {
       return respond(200, { items: searchParams.get('loadChildren') === 'true' ? roots : roots.filter((r) => r.parentId == null) });
@@ -1105,5 +1111,69 @@ describe('runMigration — targetApimVersion 4.11 or 4.12', () => {
 
     assert.equal(report.status, 'skipped_already_migrated');
     assert.equal(writes(calls).length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Legacy pages whose content the portal refuses
+// ---------------------------------------------------------------------------
+
+describe('mapLegacyPageToNavPayload — blank content', () => {
+  for (const type of ['MARKDOWN', 'SWAGGER']) {
+    it(`skips a ${type} page with blank content, before anything is created`, () => {
+      const r = mapLegacyPageToNavPayload({ type, content: '  \n' });
+      assert.equal(r.kind, 'SKIP');
+      assert.match(r.reason, /no content/i);
+    });
+  }
+
+  it('skips a blank AsyncAPI page with the API-owned writer', () => {
+    const r = mapLegacyPageToNavPayload({ type: 'ASYNCAPI', content: '' }, { asyncApi: true });
+    assert.equal(r.kind, 'SKIP');
+    assert.match(r.reason, /no content/i);
+  });
+});
+
+describe('ensurePageContent', () => {
+  it('still loads the content of a page the list returned without it', async () => {
+    mock.method(globalThis, 'fetch', async () => new Response(JSON.stringify({ id: 'p1', type: 'MARKDOWN', content: '# Loaded' }), { status: 200 }));
+
+    const page = await ensurePageContent(sampleCfg, { id: 'p1', type: 'MARKDOWN', content: '' }, 'API', 'api-1');
+
+    assert.equal(page.content, '# Loaded');
+  });
+});
+
+describe('runMigration — content the portal refuses', () => {
+  beforeEach(() => mock.method(console, 'log', () => {}));
+
+  it('creates nothing for an API whose only legacy page is empty, so a later run can migrate it', async () => {
+    const calls = fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Empty', content: '' })] },
+    });
+
+    const report = await runMigration(runCfg('4.13'), runOptions());
+
+    assert.equal(writes(calls).length, 0);
+    assert.match(report.skipped[0].reason, /no content/i);
+    assert.equal(report.apis.partial.length, 0);
+  });
+
+  it('reports the API as partially migrated when a page was created but its content refused', async () => {
+    fakeServer({
+      apiScoped: true,
+      apis: [API_V4],
+      apiPages: { 'api-4': [apiDocPage('api-4', { name: 'Too big', content: '# x' })] },
+      failContent: () => true,
+    });
+
+    const report = await runMigration(runCfg('4.13'), runOptions());
+
+    assert.equal(report.apis.partial.length, 1);
+    assert.deepEqual(report.apis.partial[0].created, ['Too big']);
+    assert.deepEqual(report.apis.partial[0].failed, ['Too big']);
+    assert.match(report.skipped[0].reason, /created without its content/i);
   });
 });

@@ -298,11 +298,11 @@ function mapLegacyPageToNavPayload(p, { asyncApi = false } = {}) {
   const raw = p.content || '';
 
   if (t === 'SWAGGER') {
-    return { kind: 'PAGE', contentType: 'OPENAPI', content: raw };
+    return pagePayload('OPENAPI', raw, t);
   }
 
   if (t === 'MARKDOWN') {
-    return { kind: 'PAGE', contentType: 'GRAVITEE_MARKDOWN', content: raw };
+    return pagePayload('GRAVITEE_MARKDOWN', raw, t);
   }
 
   if (t === 'MARKDOWN_TEMPLATE') {
@@ -324,7 +324,7 @@ function mapLegacyPageToNavPayload(p, { asyncApi = false } = {}) {
   }
 
   if (t === 'ASYNCAPI' && asyncApi) {
-    return { kind: 'PAGE', contentType: 'ASYNCAPI', content: raw };
+    return pagePayload('ASYNCAPI', raw, t);
   }
 
   if (t === 'ASYNCAPI') {
@@ -350,6 +350,18 @@ function mapLegacyPageToNavPayload(p, { asyncApi = false } = {}) {
     legacyType: t,
     reason: `Legacy type "${t}" is not migrated (unsupported for automatic portal navigation migration).`,
   };
+}
+
+/** The portal refuses a page with blank content, so such a page is skipped before anything is created for it. */
+function pagePayload(contentType, content, legacyType) {
+  if (content.trim() === '') {
+    return {
+      kind: 'SKIP',
+      legacyType,
+      reason: 'The page has no content, which portal page content does not accept; nothing was created for it.',
+    };
+  }
+  return { kind: 'PAGE', contentType, content };
 }
 
 async function fetchEnvPortalPages(cfg) {
@@ -753,11 +765,11 @@ async function updateApiPageContent(cfg, apiId, navId, content) {
 /**
  * Ensure PAGE has body (list endpoints may omit large content).
  */
+const LEGACY_PAGE_TYPES = new Set(['MARKDOWN', 'SWAGGER', 'ASYNCAPI']);
+
 async function ensurePageContent(cfg, page, scope, apiId) {
-  // AsyncAPI counts as a page here: the API-owned writer migrates it, and loading it costs nothing otherwise
-  const payload = mapLegacyPageToNavPayload(page, { asyncApi: true });
-  if (payload.kind === 'SKIP') return page;
-  if (payload.kind !== 'PAGE') return page;
+  // Decided by type, not by the mapped payload: a page the list returned without its content maps to a skip
+  if (!LEGACY_PAGE_TYPES.has((page.type || 'MARKDOWN').toUpperCase())) return page;
   if (page.content != null && String(page.content).length > 0) return page;
   try {
     if (scope === 'ENVIRONMENT') {
@@ -925,7 +937,12 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
             contentType: payload.contentType,
           };
           const created = await writer.createItem(cfg, body);
-          await writer.saveContent(cfg, created, payload.content, title);
+          try {
+            await writer.saveContent(cfg, created, payload.content, title);
+          } catch (err) {
+            err.createdWithoutContent = true;
+            throw err;
+          }
           ord += 1;
           const result = {
             OPENAPI: 'OpenAPI / Swagger body stored in portal page content',
@@ -950,7 +967,10 @@ async function migrateSubtreeFlat(cfg, pages, subsetIds, parentNavId, orderOffse
           scope,
           apiId,
           apiName,
-          reason: `Migration failed: ${err.message || err}`,
+          createdWithoutContent: err.createdWithoutContent === true,
+          reason: err.createdWithoutContent
+            ? `Migration failed: the page was created without its content, delete it before running again (${err.message || err})`
+            : `Migration failed: ${err.message || err}`,
         });
       }
     }
@@ -1256,11 +1276,13 @@ async function migrateApiOwnedDocumentation(cfg, apis, apiPagesByApiId, allPages
     const migratedBefore = report.migrated.length;
     const skippedBefore = report.skipped.length;
     await migrateSubtreeFlat(cfg, pagesForApi, subsetIds, null, 0, true, undefined, report, apis, apiOwnedWriter(apiId));
-    const created = report.migrated.slice(migratedBefore).map((m) => m.title);
-    const failed = report.skipped
-      .slice(skippedBefore)
-      .filter((s) => String(s.reason).startsWith('Migration failed'))
-      .map((s) => s.title);
+    const skippedNow = report.skipped.slice(skippedBefore);
+    // A page created without its content is on the API too, and makes the next run skip it
+    const created = [
+      ...report.migrated.slice(migratedBefore).map((m) => m.title),
+      ...skippedNow.filter((s) => s.createdWithoutContent).map((s) => s.title),
+    ];
+    const failed = skippedNow.filter((s) => String(s.reason).startsWith('Migration failed')).map((s) => s.title);
 
     if (created.length > 0 && failed.length > 0) {
       report.apis.partial.push({ apiId, apiName, created, failed });
@@ -1285,6 +1307,7 @@ export {
   checkTargetVersionAgainstServer,
   collectReferencedApiIdsFromNavItems,
   createReport,
+  ensurePageContent,
   escapeMdCell,
   formatMigrationReportMarkdown,
   getPageId,
