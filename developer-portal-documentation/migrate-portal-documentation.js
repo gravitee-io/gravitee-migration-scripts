@@ -640,7 +640,11 @@ function printMigrationSuccessMessage(report, reportPath) {
   } else {
     console.log('Portal navigation migration — completed successfully');
     console.log(sep);
-    console.log('Legacy documentation was imported into portal navigation under the new folder tree.');
+    console.log(
+      report.writer === 'api'
+        ? 'Legacy API documentation was imported as documentation owned by each API.'
+        : 'Legacy documentation was imported into portal navigation under the new folder tree.',
+    );
   }
   console.log('');
   console.log(`  Organization     ${report.organizationId}`);
